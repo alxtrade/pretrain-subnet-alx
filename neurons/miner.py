@@ -149,4 +149,84 @@ except Exception as e:
     bt.logging.success(f'First run, creating new run_id: {run_id} {e}')
 
 with open(run_id_file, 'w') as f:
-    json.dump({'WANDB_RUN_ID': run_id
+    json.dump({'WANDB_RUN_ID': run_id}, f)
+    bt.logging.success(f'Saved: {run_id} to file.')
+
+run_name = f'miner-{my_uid}-' + ''.join(random.choice(string.ascii_uppercase + string.digits) for i in range(10))
+config.uid = my_uid
+config.hotkey = wallet.hotkey.ss58_address
+config.run_name = run_name
+config.version = pretrain.__version__
+config.type = 'miner'
+wandb_run = wandb.init(
+    id=run_id,
+    name=run_name,
+    anonymous="allow",
+    project=pretrain.WANDB_PROJECT,
+    entity='opentensor-dev',
+    config=config,
+    dir=config.full_path,
+    allow_val_change=True,
+)
+
+signature = wallet.hotkey.sign(wandb_run.id.encode()).hex()
+config.signature = signature
+wandb.config.update(config, allow_val_change=True)
+bt.logging.success(f'Successfully signed wandb run with signature {config.signature}')
+
+wandb.save(config.model_path)
+bt.logging.success('Pushed artifact to the wandb run.')
+
+epoch_step = 0
+global_step = 0
+n_acc_steps = 0
+accumulation_steps = config.accumulation_steps
+
+try:
+    while epoch_step < config.num_epochs or config.num_epochs == -1:
+        epoch_loss = 0.0
+        bt.logging.success(f"Loading {config.pages_per_epoch} pages for training this epoch")
+        random_pages = [random.randint(1, pretrain.dataset.SubsetFalconLoader.max_pages) for _ in range(config.pages_per_epoch)]
+        loader = pretrain.dataset.SubsetFalconLoader(
+            batch_size=config.bs,
+            sequence_length=config.sl,
+            pages=random_pages
+        )
+
+        n_batches = 0
+        optimizer.zero_grad()
+
+        for i, batch in enumerate(loader):
+            inputs = batch.to(model.device)
+            outputs = model(inputs, labels=inputs)
+
+            loss = outputs.loss / accumulation_steps
+            loss.backward()
+
+            if (i + 1) % accumulation_steps == 0:
+                n_acc_steps += 1
+                optimizer.step()
+                optimizer.zero_grad()
+                bt.logging.success(f'Step: {n_acc_steps} loss: {outputs.loss.detach().item()}')
+                wandb.log({'loss': outputs.loss.detach(), 'n_batches': n_batches}, step=n_acc_steps)
+
+            torch.cuda.empty_cache()
+
+            n_batches += 1
+            global_step += 1
+            epoch_loss += outputs.loss.detach().item()
+
+        avg_loss = epoch_loss / n_batches
+        bt.logging.success(f'Epoch: {epoch_step} average loss: {avg_loss}')
+        epoch_step += 1
+
+        if avg_loss < best_avg_loss * (1 - pretrain.timestamp_epsilon):
+            best_avg_loss = avg_loss
+            bt.logging.success(f'New best average loss: {best_avg_loss}. Saving model...')
+
+            torch.save(model.state_dict(), config.model_path)
+            wandb.save(config.model_path)
+            bt.logging.success('Pushed the new artifact to the wandb run.')
+
+finally:
+    wandb.finish()
